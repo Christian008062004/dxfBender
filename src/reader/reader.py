@@ -14,48 +14,59 @@ for p in (CURRENT_DIR, PARENT_DIR):
     if str(p) not in sys.path:
         sys.path.append(str(p))
 
-from entities.polyline_utils import (  # noqa: E402
-    pairwise,
-    polyline_length,
-    point_on_polyline,
-    lwpolyline_to_points,
-)
-from entities.spline_utils import spline_to_points  # noqa: E402
-from entities.arc_utils import arc_to_points  # noqa: E402
-from entities.circle_utils import circle_to_points  # noqa: E402
-from entities.ellipse_utils import ellipse_to_points  # noqa: E402
-from entities.line_utils import line_to_points  # noqa: E402
+from entities.base.entity_interface import EntityInterface  # noqa: E402
+from entities.shapes.polyline_utils import LwPolylineEntity  # noqa: E402
+from entities.shapes.spline_utils import SplineEntity  # noqa: E402
+from entities.shapes.arc_utils import ArcEntity  # noqa: E402
+from entities.shapes.circle_utils import CircleEntity  # noqa: E402
+from entities.shapes.ellipse_utils import EllipseEntity  # noqa: E402
+from entities.shapes.line_utils import LineEntity  # noqa: E402
 
 # Standard-Pfad zu einer Beispieldatei, falls kein Pfad uebergeben wird.
 DEFAULT_DXF = Path("data/dxfData/Cubische Bezierkurve.dxf")
+CONVERTERS = {
+    "LINE": LineEntity.from_dxf,
+    "ARC": ArcEntity.from_dxf,
+    "CIRCLE": CircleEntity.from_dxf,
+    "ELLIPSE": EllipseEntity.from_dxf,
+    "LWPOLYLINE": LwPolylineEntity.from_dxf,
+    "SPLINE": SplineEntity.from_dxf,
+}
 
 
 def get_curve_info(entity) -> Optional[Tuple[Vec3, Vec3, float, List[Vec3], bool]]:
     """Konvertiert unterstuetzte DXF-Entities in eine Polyline-Repraesentation."""
     kind = entity.dxftype()
-    # Mapping von DXF-Typ zu Konverter-Funktion.
-    converters = {
-        "LINE": line_to_points,
-        "ARC": arc_to_points,
-        "CIRCLE": circle_to_points,
-        "ELLIPSE": ellipse_to_points,
-        "LWPOLYLINE": lwpolyline_to_points,
-        "SPLINE": spline_to_points,
-    }
-
-    if kind not in converters:
+    # Mapping von DXF-Typ zu Entity-Wrappern.
+    if kind not in CONVERTERS:
         return None
 
-    # Punkte + Closed-Flag erzeugen.
-    pts, closed = converters[kind](entity)
+    curve: EntityInterface = CONVERTERS[kind](entity)
+    pts, closed = curve.as_polyline()
     if len(pts) == 0:
         return None
 
     # Start/Ende bestimmen (bei geschlossenem Objekt Ende = Start) und Laenge.
-    start = pts[0]
-    end = pts[0] if closed else pts[-1]
-    length = polyline_length(pts, closed)
+    start = curve.start()
+    end = curve.end()
+    length = curve.length()
     return start, end, length, pts, closed
+
+
+def _add_segmentized_entity(
+    entity, out_msp, segment_length: float, layer: str = "0"
+) -> None:
+    """Fuegt segmentierte Linien fuer eine Eingabe-Entity in den Ziel-Modelspace ein."""
+    curve: EntityInterface = CONVERTERS[entity.dxftype()](entity)
+    seg_pts, seg_closed = curve.segmentize(segment_length)
+    if len(seg_pts) < 2:
+        return
+
+    pts2d = [(float(p.x), float(p.y), 0.0) for p in seg_pts]
+    for a, b in zip(pts2d, pts2d[1:]):
+        out_msp.add_line(a, b, dxfattribs={"layer": layer})
+    if seg_closed and pts2d[0] != pts2d[-1]:
+        out_msp.add_line(pts2d[-1], pts2d[0], dxfattribs={"layer": layer})
 
 
 def main() -> None:
@@ -67,17 +78,15 @@ def main() -> None:
         help=f"Pfad zur DXF-Datei (Standard: {DEFAULT_DXF})",
     )
     parser.add_argument(
-        "--point",
-        nargs=2,
+        "--segment-length",
         type=float,
-        metavar=("X", "Y"),
-        help="Testpunkt in der Form: X Y",
+        default=5.0,
+        help="Maximale Segmentlaenge fuer Ausgabe-DXF (Standard: 5.0)",
     )
     parser.add_argument(
-        "--tol",
-        type=float,
-        default=1e-3,
-        help="Toleranz fuer Punkttest (Standard: 1e-3)",
+        "--segmentized-dxf",
+        type=Path,
+        help="Optionaler Pfad fuer eine ausgegebene DXF mit segmentierten Kurven.",
     )
     args = parser.parse_args()
 
@@ -86,11 +95,15 @@ def main() -> None:
     if not dxf_path.exists():
         raise SystemExit(f"DXF-Datei nicht gefunden: {dxf_path}")
 
-    test_point = Vec3(args.point[0], args.point[1], 0) if args.point else None
-
     # DXF lesen und alle Entities im Modelspace durchlaufen.
     doc = ezdxf.readfile(dxf_path)
     msp = doc.modelspace()
+
+    out_doc = ezdxf.new("R2000", setup=True) if args.segmentized_dxf else None
+    out_msp = out_doc.modelspace() if out_doc else None
+    if out_doc:
+        # Einheit metrisch: Millimeter (4)
+        out_doc.header["$INSUNITS"] = 4
 
     print(f"\nDatei: {dxf_path}")
     print("Gefundene Kurven:")
@@ -101,6 +114,9 @@ def main() -> None:
             continue
 
         start, end, length, polyline, closed = info
+        # Segmentierte Ausgabe bauen, falls angefordert.
+        if out_msp is not None:
+            _add_segmentized_entity(entity, out_msp, args.segment_length, layer="0")
 
         print("------------------------------------------------")
         print(f"Kurventyp:  {entity.dxftype()}")
@@ -109,12 +125,10 @@ def main() -> None:
         print(f"Laenge:     {length:.3f}")
         print(f"Closed:     {closed}")
 
-        if test_point is not None:
-            # Punkt-Kurve-Test mit Toleranz.
-            if point_on_polyline(polyline, test_point, closed=closed, tol=args.tol):
-                print(f"Punkt {test_point} LIEGT auf der Kurve (tol={args.tol}).")
-            else:
-                print(f"Punkt {test_point} liegt NICHT auf der Kurve (tol={args.tol}).")
+    if out_doc and args.segmentized_dxf:
+        args.segmentized_dxf.parent.mkdir(parents=True, exist_ok=True)
+        out_doc.saveas(args.segmentized_dxf)
+        print(f"\nSegmentierte DXF gespeichert nach: {args.segmentized_dxf}")
 
 
 if __name__ == "__main__":
